@@ -21,7 +21,7 @@ Workload：YCSB workload(a-d)，记录数和操作数均为128M（10GB data）
 | ------ | ----- | ---- | ---- | ---- | ---- |
 | remote | 87.5% | 75%  | 50%  | 25%  | 0%   |
 
-1. 调整 zipf 参数
+2. 调整 zipf 参数
 
 zipf_s_arr=(0 0.05 0.1 0.15 0.2 0.25 0.3 0.35 0.4 0.45 0.5 0.55 0.6 0.65 0.7 0.75 0.8 0.85 0.9 0.95 1 1.05 1.1 1.15 1.2 1.25 1.3 1.35)
 
@@ -238,5 +238,6 @@ chmod 600 /root/.ssh/id_rsa
 ![img](https://jianmucloud.feishu.cn/space/api/box/stream/download/asynccode/?code=YTczNWM3ZmQ5OGQwZjg0ODlkNTNmZTNhZDVlMWYwY2ZfQmtvTVNQQ2p2OFN1Y0FISlNpTXFLV3M1aGRqWWxVMVhfVG9rZW46SURFWmJxZ0VVb2lHV0t4ZWNBZ2NpaUl2bk15XzE3NTQ4ODg1OTE6MTc1NDg5MjE5MV9WNA)
 
 ## Result
+
 
 待更新
