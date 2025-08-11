@@ -1,0 +1,107 @@
+YCSB Compatible Benchmark Results (Fixed Overflow Version)
+Generated at: 2025-08-10 07:41:22
+Command: ./ycsb_hashtable_compatible workloada.txt workloadb.txt workloadc.txt workloadd.txt 
+================================================================================
+
+============================================================
+YCSB Compatible Workload: workloada.txt
+============================================================
+
+=== YCSB Compatible Benchmark Results ===
+Overall Performance:
+  Total Operations: 128000000
+  Successful Operations: 128000000
+  Failed Operations: 0
+  Success Rate: 100.00%
+  Total Time: 153616.89 ms
+  Throughput: 833241.71 ops/sec
+  Average Latency: 0.00 ms/op
+
+Operation Breakdown:
+  READ Operations: 63996170
+    Average Latency: 0.00 ms/op
+  UPDATE Operations: 64003830
+    Average Latency: 0.00 ms/op
+
+Final HashTable Size: 128000000
+
+============================================================
+YCSB Compatible Workload: workloadb.txt
+============================================================
+
+=== YCSB Compatible Benchmark Results ===
+Overall Performance:
+  Total Operations: 128000000
+  Successful Operations: 128000000
+  Failed Operations: 0
+  Success Rate: 100.00%
+  Total Time: 86032.68 ms
+  Throughput: 1487806.68 ops/sec
+  Average Latency: 0.00 ms/op
+
+Operation Breakdown:
+  READ Operations: 121602362
+    Average Latency: 0.00 ms/op
+  UPDATE Operations: 6397638
+    Average Latency: 0.00 ms/op
+
+Final HashTable Size: 128000000
+
+============================================================
+YCSB Compatible Workload: workloadc.txt
+============================================================
+
+=== YCSB Compatible Benchmark Results ===
+Overall Performance:
+  Total Operations: 128000000
+  Successful Operations: 128000000
+  Failed Operations: 0
+  Success Rate: 100.00%
+  Total Time: 81142.22 ms
+  Throughput: 1577477.14 ops/sec
+  Average Latency: 0.00 ms/op
+
+Operation Breakdown:
+  READ Operations: 128000000
+    Average Latency: 0.00 ms/op
+
+Final HashTable Size: 128000000
+
+============================================================
+YCSB Compatible Workload: workloadd.txt
+============================================================
+
+=== YCSB Compatible Benchmark Results ===
+Overall Performance:
+  Total Operations: 128000000
+  Successful Operations: 128000000
+  Failed Operations: 0
+  Success Rate: 100.00%
+  Total Time: 82245.66 ms
+  Throughput: 1556313.16 ops/sec
+  Average Latency: 0.00 ms/op
+
+Operation Breakdown:
+  READ Operations: 121602013
+    Average Latency: 0.00 ms/op
+  INSERT Operations: 6397987
+    Average Latency: 0.00 ms/op
+
+Final HashTable Size: 134397987
+
+================================================================================
+YCSB COMPATIBLE BENCHMARK SUMMARY
+================================================================================
+Overall Session Statistics:
+  Total Workloads Tested: 4
+  Total Session Time: 1829.88 seconds
+  Peak Memory Usage: 45580.83 MB (46674772 KB)
+  Session Completed At: 2025-08-10 08:11:52
+
+Tested Workloads:
+  workloada.txt (records: 128000000, ops: 128000000, insertorder: hashed, fields: 2)
+  workloadb.txt (records: 128000000, ops: 128000000, insertorder: hashed, fields: 2)
+  workloadc.txt (records: 128000000, ops: 128000000, insertorder: hashed, fields: 2)
+  workloadd.txt (records: 128000000, ops: 128000000, insertorder: hashed, fields: 2)
+
+================================================================================
