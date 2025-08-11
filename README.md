@@ -1,4 +1,5 @@
 [AIFM 8.2.1] | [fig9]
+# Introduction
 此 Benchmark 是一个基于 C++ 标准库的性能测试工具，用于评估哈希表在 memcached-style 的工作负载下的性能表现，支持多种请求分布（uniform、zipfian、latest）模式。
 Intro
 - Provide unordered maps
