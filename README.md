@@ -1,3 +1,7 @@
+25/08/13 更新benchmark：改为400线程+记录运行前4min的MOPS(每10s记录一次)
+
+===========================================
+
 此 Benchmark 是一个基于 C++ 标准库的性能测试工具，用于评估哈希表在 memcached-style 的工作负载下的性能表现，支持多种请求分布（uniform、zipfian、latest）模式。
 
 # Intro
@@ -241,4 +245,5 @@ chmod 600 /root/.ssh/id_rsa
 
 
 待更新
+
 
