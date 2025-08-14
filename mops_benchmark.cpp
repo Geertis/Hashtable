@@ -232,7 +232,7 @@ private:
         std::discrete_distribution<int> discrete_dist;
 
     public:
-        zipf_distribution(int n = 1000, double s = 0.99) {
+        zipf_distribution(int n = 1000, double s = 0.8) {
             probabilities.resize(n);
             double sum = 0.0;
 
@@ -254,7 +254,7 @@ private:
         }
     };
 
-    zipf_distribution zipf_gen{ 1000, 0.99 };
+    zipf_distribution zipf_gen{ 1000, 0.8 };
 
 public:
     DistributionGenerator() : gen(std::random_device{}()) {}
@@ -783,4 +783,5 @@ int main(int argc, char* argv[]) {
         << global_stats.total_benchmark_time_ms / 1000.0 << " seconds" << std::endl;
 
     return 0;
+
 }
