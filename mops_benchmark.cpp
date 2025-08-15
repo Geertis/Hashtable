@@ -1,574 +1,476 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
-#include <iomanip>
 #include <iostream>
-#include <mutex>
-#include <numeric>
+#include <memory>
 #include <random>
-#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
-#include <utility>
 #include <vector>
+#include <iomanip>
+#include <mutex>
+#include <shared_mutex>
 
-// =========================
-// Utilities: barrier (C++17)
-// =========================
-class SimpleBarrier {
-    std::mutex mtx_;
-    std::condition_variable cv_;
-    size_t count_;
-    size_t arrived_ = 0;
-    size_t gen_ = 0;
+// 全局参数 - 会被workload文件覆盖
+static double kReadProportion = 0.5;
+static double kUpdateProportion = 0.5;
+static double kInsertProportion = 0.0;
+static double kScanProportion = 0.0;
+static double kRMWProportion = 0.0;
+static std::string kRequestDistribution = "zipfian";
+
+// 固定参数
+constexpr static int64_t kRecordCount = 128000000;
+constexpr static uint32_t kKeyLen = 32;
+constexpr static uint32_t kValueLen = 64;
+constexpr static uint32_t kNumMutatorThreads = 400;
+constexpr static uint32_t kReqSeqLenPerCore = 1 << 20; // 1M per core
+constexpr static uint32_t kMonitorPerIter = 1024;
+constexpr static uint32_t kMinMonitorIntervalUs = 10 * 1000 * 1000; // 10秒
+constexpr static uint32_t kMaxRunningUs = 200 * 1000 * 1000; // 200秒
+constexpr static double kZipfParamS = 0.8;
+
+// FNV Hash
+class FNVHash {
+public:
+    static uint64_t hash(uint64_t val) {
+        const uint64_t FNV_OFFSET_BASIS = 0xCBF29CE484222325ULL;
+        const uint64_t FNV_PRIME = 1099511628211ULL;
+
+        uint64_t hashval = FNV_OFFSET_BASIS;
+        for (int i = 0; i < 8; i++) {
+            uint8_t octet = val & 0x00ff;
+            val = val >> 8;
+            hashval = hashval ^ octet;
+            hashval = hashval * FNV_PRIME;
+        }
+        return hashval > 0 ? hashval : -hashval;
+    }
+};
+
+// Zipf分布
+class ZipfDistribution {
+private:
+    std::vector<double> prob_;
+    std::discrete_distribution<int64_t> dist_;
 
 public:
-    explicit SimpleBarrier(size_t count) : count_(count) {}
-    void arrive_and_wait() {
-        std::unique_lock<std::mutex> lk(mtx_);
-        size_t g = gen_;
-        if (++arrived_ == count_) {
-            arrived_ = 0;
-            ++gen_;
-            cv_.notify_all();
+    ZipfDistribution(int64_t n, double s) {
+        prob_.resize(n);
+        double sum = 0.0;
+        for (int64_t i = 1; i <= n; ++i) {
+            prob_[i - 1] = 1.0 / std::pow(i, s);
+            sum += prob_[i - 1];
         }
-        else {
-            cv_.wait(lk, [&] { return g != gen_; });
+        for (auto& p : prob_) p /= sum;
+        dist_ = std::discrete_distribution<int64_t>(prob_.begin(), prob_.end());
+    }
+
+    template<class Gen>
+    int64_t operator()(Gen& gen) { return dist_(gen); }
+};
+
+// 分布生成器
+class DistributionGenerator {
+private:
+    std::mt19937 gen;
+    std::uniform_real_distribution<double> uniform_dist{ 0.0, 1.0 };
+
+public:
+    DistributionGenerator() : gen(std::random_device{}()) {}
+
+    int64_t generateKey(const std::string& distribution, int64_t range) {
+        if (distribution == "zipfian") {
+            ZipfDistribution zipf(range, kZipfParamS);
+            return zipf(gen);
         }
+        else if (distribution == "latest") {
+            std::exponential_distribution<double> exp_dist(2.0);
+            int64_t offset = static_cast<int64_t>(exp_dist(gen));
+            return std::max(static_cast<int64_t>(0), range - 1 - offset % range);
+        }
+        else if (distribution == "sequential") {
+            static std::atomic<int64_t> seq_counter{ 0 };
+            return (seq_counter++) % range;
+        }
+        else { // uniform
+            std::uniform_int_distribution<int64_t> dist(0, range - 1);
+            return dist(gen);
+        }
+    }
+
+    double generateDouble() {
+        return uniform_dist(gen);
     }
 };
 
-// =========================
-// FNV-1a 64-bit hash (same as AIFM main)
-// =========================
-struct FNVHash {
-    static constexpr uint64_t kOffset = 0xCBF29CE484222325ULL;
-    static constexpr uint64_t kPrime = 1099511628211ULL;
-    static uint64_t hash(uint64_t v) {
-        uint64_t h = kOffset;
-        for (int i = 0; i < 8; ++i) {
-            uint8_t o = v & 0xFF;
-            v >>= 8;
-            h ^= o;
-            h *= kPrime;
-        }
-        return h ? h : -h;
+// 键生成器
+class KeyGenerator {
+public:
+    static void generateKey(int64_t keynum, char* key_data, uint32_t key_len) {
+        uint64_t hashedKey = FNVHash::hash(static_cast<uint64_t>(keynum));
+        std::string keyStr = "user" + std::to_string(hashedKey);
+        strncpy(key_data, keyStr.c_str(), key_len);
+        key_data[key_len - 1] = '\0';
     }
 };
 
-// =========================
-// Workload configuration (kept compatible with your AIFM main)
-// =========================
-struct WorkloadConfig {
-    int64_t recordcount = 1000;
-    std::string workload = "site.ycsb.workloads.CoreWorkload";
-    int fieldcount = 2;
-    int fieldlength = 15;
-    int minfieldlength = 1;
-    std::string fieldlengthdistribution = "constant";
-    std::string fieldnameprefix = "field";
-    bool readallfields = true;
-    double readproportion = 0.5;     // default to 50/50 read/update
-    double updateproportion = 0.5;
-    double scanproportion = 0.0;
-    double insertproportion = 0.0;
-    double readmodifywriteproportion = 0.0;
-    std::string requestdistribution = "zipfian"; // match AIFM default
-    std::string insertorder = "hashed";          // match AIFM default
-    int maxscanlength = 1000;
-    int minscanlength = 1;
-    std::string scanlengthdistribution = "uniform";
-    int zeropadding = 1;
-    int64_t insertstart = 0;
-    int64_t insertcount = -1;
-    int threadcount = 400; // hard high-concurrency
-    static constexpr int64_t kFixedRuntimeSeconds = 240; // 4 minutes
-    static constexpr int64_t kMonitorIntervalSeconds = 10; // every 10s
+// 数据结构
+struct Key {
+    char data[kKeyLen];
 };
 
-// =========================
-// Record representation
-// =========================
-struct Record {
-    std::string key;
-    std::vector<std::pair<std::string, std::string>> fields;
+struct Value {
+    char data[kValueLen];
 };
 
-// =========================
-// Striped concurrent hash table (true multi-threading)
-// =========================
+struct alignas(64) Cnt {
+    uint64_t c;
+};
+
+// 并发哈希表
 class ConcurrentHashTable {
+private:
     struct Bucket {
-        std::unordered_map<std::string, Record> map;
+        std::unordered_map<std::string, std::string> data;
         mutable std::shared_mutex mtx;
+        char padding[64];
     };
-    std::vector<Bucket> stripes_;
 
-    static size_t str_hash(const std::string& s) {
-        // Use std::hash<string>; good enough for striping
-        return std::hash<std::string>{}(s);
-    }
+    std::vector<std::unique_ptr<Bucket>> buckets_;
+    size_t mask_;
 
-    Bucket& bucket_for(const std::string& key) {
-        return stripes_[str_hash(key) % stripes_.size()];
-    }
-    const Bucket& bucket_for(const std::string& key) const {
-        return stripes_[str_hash(key) % stripes_.size()];
+    size_t getBucket(const std::string& key) const {
+        return std::hash<std::string>{}(key)&mask_;
     }
 
 public:
-    explicit ConcurrentHashTable(size_t stripes = 1024) : stripes_(stripes) {}
+    ConcurrentHashTable(size_t num_buckets = 2048) {
+        size_t actual = 1;
+        while (actual < num_buckets) actual <<= 1;
 
-    void reserve(size_t n) {
-        size_t per = std::max<size_t>(1, n / stripes_.size());
-        for (auto& b : stripes_) b.map.reserve(per);
+        buckets_.reserve(actual);
+        for (size_t i = 0; i < actual; ++i) {
+            buckets_.push_back(std::make_unique<Bucket>());
+        }
+        mask_ = actual - 1;
     }
 
-    bool insert(const std::string& key, const Record& rec) {
-        auto& b = bucket_for(key);
-        std::unique_lock<std::shared_mutex> lk(b.mtx);
-        b.map[key] = rec;
-        return true;
+    void put(const std::string& key, const std::string& value) {
+        auto& bucket = *buckets_[getBucket(key)];
+        std::unique_lock<std::shared_mutex> lock(bucket.mtx);
+        bucket.data[key] = value;
     }
 
-    bool read(const std::string& key, Record& out, bool all_fields = true) const {
-        const auto& b = bucket_for(key);
-        std::shared_lock<std::shared_mutex> lk(b.mtx);
-        auto it = b.map.find(key);
-        if (it == b.map.end()) return false;
-        out = it->second;
-        if (!all_fields && !out.fields.empty()) {
-            thread_local std::mt19937 gen(std::random_device{}());
-            std::uniform_int_distribution<size_t> dist(0, out.fields.size() - 1);
-            size_t idx = dist(gen);
-            Record r{ out.key, {out.fields[idx]} };
-            out = std::move(r);
+    bool get(const std::string& key, std::string& value) {
+        auto& bucket = *buckets_[getBucket(key)];
+        std::shared_lock<std::shared_mutex> lock(bucket.mtx);
+        auto it = bucket.data.find(key);
+        if (it != bucket.data.end()) {
+            value = it->second;
+            return true;
         }
-        return true;
-    }
-
-    bool update(const std::string& key, const Record& rec, bool write_all = true) {
-        auto& b = bucket_for(key);
-        std::unique_lock<std::shared_mutex> lk(b.mtx);
-        auto it = b.map.find(key);
-        if (it == b.map.end()) return false;
-        if (write_all) {
-            it->second = rec;
-        }
-        else {
-            if (!rec.fields.empty() && !it->second.fields.empty()) {
-                thread_local std::mt19937 gen(std::random_device{}());
-                std::uniform_int_distribution<size_t> dist(0, it->second.fields.size() - 1);
-                size_t idx = dist(gen);
-                it->second.fields[idx] = rec.fields[0];
-            }
-        }
-        return true;
-    }
-
-    bool scan(const std::string& start_key, int count, std::vector<Record>& out) const {
-        out.clear();
-        // Lock all stripes with shared lock in a fixed order to avoid deadlock.
-        std::vector<std::shared_lock<std::shared_mutex>> locks;
-        locks.reserve(stripes_.size());
-        for (auto& b : stripes_) locks.emplace_back(b.mtx);
-
-        int scanned = 0;
-        for (const auto& b : stripes_) {
-            for (const auto& kv : b.map) {
-                if (kv.first >= start_key) {
-                    out.push_back(kv.second);
-                    if (++scanned >= count) return true;
-                }
-            }
-        }
-        return !out.empty();
+        return false;
     }
 
     size_t size() const {
         size_t total = 0;
-        for (auto& b : stripes_) {
-            std::shared_lock<std::shared_mutex> lk(b.mtx);
-            total += b.map.size();
+        for (auto& bucket : buckets_) {
+            std::shared_lock<std::shared_mutex> lock(bucket->mtx);
+            total += bucket->data.size();
         }
         return total;
     }
-
-    void clear() {
-        for (auto& b : stripes_) {
-            std::unique_lock<std::shared_mutex> lk(b.mtx);
-            b.map.clear();
-        }
-    }
 };
 
-// =========================
-// Distributions (zipf/uniform/latest/sequential)
-// =========================
-class DistributionGenerator {
-    std::mt19937 gen{ std::random_device{}() };
-    std::uniform_real_distribution<double> uni{ 0.0, 1.0 };
+// 全局变量
+std::atomic_flag flag;
+std::unique_ptr<std::mt19937> generators[kNumMutatorThreads];
+thread_local uint32_t per_core_req_idx = 0;
+Key* all_gen_keys;
+uint32_t all_zipf_key_indices[kNumMutatorThreads][kReqSeqLenPerCore];
+Cnt cnts[kNumMutatorThreads];
+std::vector<double> mops_vec;
+uint64_t prev_sum_cnts = 0;
+uint64_t prev_us = 0;
+uint64_t running_us = 0;
+std::atomic<int64_t> global_insert_counter{ 0 };
+ConcurrentHashTable* table_ptr;
+std::ofstream log_file;
 
-    // Simple discrete Zipf sampler to mirror AIFM main's s=0.8
-    class Zipf {
-        std::vector<double> prob_;
-        std::discrete_distribution<int> dist_;
-    public:
-        Zipf(int n = 1000, double s = 0.8) {
-            prob_.resize(n);
-            double sum = 0.0;
-            for (int i = 1; i <= n; ++i) { prob_[i - 1] = 1.0 / std::pow(i, s); sum += prob_[i - 1]; }
-            for (auto& p : prob_) p /= sum;
-            dist_ = std::discrete_distribution<int>(prob_.begin(), prob_.end());
-        }
-        template<class G> int operator()(G& g) { return dist_(g); }
-    };
+uint64_t microtime() {
+    auto now = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
+}
 
-    Zipf zipf_{ 100000, 0.8 }; // large-ish support for hotspot behavior
-
-public:
-    int64_t generateKey(const std::string& distribution, int64_t range) {
-        if (distribution == "zipfian") {
-            return zipf_(gen) % range;
-        }
-        else if (distribution == "latest") {
-            std::exponential_distribution<double> e(2.0);
-            int64_t off = static_cast<int64_t>(e(gen));
-            return std::max<int64_t>(0, range - 1 - (off % range));
-        }
-        else if (distribution == "sequential") {
-            static std::atomic<int64_t> c{ 0 };
-            return (c++) % range;
-        }
-        else {
-            std::uniform_int_distribution<int64_t> d(0, range - 1);
-            return d(gen);
-        }
+void generateValue(char* data, uint32_t len, DistributionGenerator& gen) {
+    const std::string chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    for (uint32_t i = 0; i < len; ++i) {
+        data[i] = chars[static_cast<size_t>(gen.generateDouble() * chars.length())];
     }
-    double generateDouble() { return uni(gen); }
-    int generateScanLength(const std::string& dist, int minL, int maxL) {
-        if (dist == "uniform") {
-            std::uniform_int_distribution<int> d(minL, maxL); return d(gen);
-        }
-        else if (dist == "zipfian") {
-            Zipf z(maxL - minL + 1, 0.99); return minL + z(gen);
-        }
-        else { return minL; }
-    }
-    int generateFieldLength(const std::string& dist, int minL, int maxL) {
-        if (dist == "uniform") {
-            std::uniform_int_distribution<int> d(minL, maxL); return d(gen);
-        }
-        else if (dist == "zipfian") {
-            Zipf z(maxL - minL + 1, 0.99); return minL + z(gen);
-        }
-        else { return maxL; }
-    }
-};
+    data[len - 1] = '\0';
+}
 
-// =========================
-// Key generator (identical behavior to AIFM main)
-// =========================
-class KeyGenerator {
-    std::string insert_order_;
-    int zero_padding_;
-public:
-    KeyGenerator(std::string order = "hashed", int padding = 1)
-        : insert_order_(std::move(order)), zero_padding_(padding) {}
-
-    std::string generateKey(int64_t keynum) const {
-        if (insert_order_ == "hashed") {
-            uint64_t h = FNVHash::hash(static_cast<uint64_t>(keynum));
-            return std::string("user") + std::to_string(h);
-        }
-        std::ostringstream oss;
-        if (zero_padding_ > 1) {
-            oss << "user" << std::setfill('0') << std::setw(zero_padding_) << keynum;
-        }
-        else {
-            oss << "user" << keynum;
-        }
-        return oss.str();
-    }
-};
-
-// =========================
-// Benchmark driver
-// =========================
-class MultiThreadedYCSBBenchmark {
-    ConcurrentHashTable table_;
-    std::string outfile_;
-    std::atomic<bool> stop_{ false };
-    std::atomic<int64_t> global_insert_counter_{ 0 };
-    std::atomic<int64_t> total_ops_{ 0 };
-    std::mutex mops_mu_;
-    std::vector<double> mops_; // per-interval
-
-    static std::string randValue(int len, DistributionGenerator& g) {
-        static const std::string chars =
-            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-        std::string s; s.resize(len);
-        for (int i = 0; i < len; ++i) s[i] = chars[static_cast<size_t>(g.generateDouble() * chars.size())];
-        return s;
+// workload文件解析
+void parseWorkloadFile(const std::string& filename) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cout << "Warning: Could not open " << filename << ", using defaults" << std::endl;
+        return;
     }
 
-    Record makeRecord(const std::string& key, const WorkloadConfig& cfg, DistributionGenerator& g) {
-        Record r; r.key = key; r.fields.reserve(cfg.fieldcount);
-        for (int i = 0; i < cfg.fieldcount; ++i) {
-            int len = g.generateFieldLength(cfg.fieldlengthdistribution, cfg.minfieldlength, cfg.fieldlength);
-            r.fields.emplace_back(cfg.fieldnameprefix + std::to_string(i), randValue(len, g));
+    std::cout << "Parsing " << filename << std::endl;
+    std::string line;
+    while (std::getline(file, line)) {
+        // 移除空格
+        line.erase(std::remove_if(line.begin(), line.end(), ::isspace), line.end());
+        if (line.empty() || line[0] == '#') continue;
+
+        auto eq_pos = line.find('=');
+        if (eq_pos == std::string::npos) continue;
+
+        auto key = line.substr(0, eq_pos);
+        auto value = line.substr(eq_pos + 1);
+
+        if (key == "readproportion") {
+            kReadProportion = std::stod(value);
         }
-        return r;
+        else if (key == "updateproportion") {
+            kUpdateProportion = std::stod(value);
+        }
+        else if (key == "insertproportion") {
+            kInsertProportion = std::stod(value);
+        }
+        else if (key == "scanproportion") {
+            kScanProportion = std::stod(value);
+        }
+        else if (key == "readmodifywriteproportion") {
+            kRMWProportion = std::stod(value);
+        }
+        else if (key == "requestdistribution") {
+            kRequestDistribution = value;
+        }
     }
 
-    void loadWorker(const WorkloadConfig& cfg, int tid, int nthreads, SimpleBarrier& bar) {
-        KeyGenerator kg(cfg.insertorder, cfg.zeropadding);
-        DistributionGenerator g;
-        int64_t per = cfg.insertcount / nthreads;
-        int64_t start = cfg.insertstart + tid * per;
-        int64_t end = (tid == nthreads - 1) ? (cfg.insertstart + cfg.insertcount) : (start + per);
+    std::cout << "Loaded: Read=" << kReadProportion << " Update=" << kUpdateProportion
+        << " Insert=" << kInsertProportion << " RMW=" << kRMWProportion
+        << " Dist=" << kRequestDistribution << std::endl;
+}
 
-        for (int64_t i = start; i < end; ++i) {
-            std::string k = kg.generateKey(i);
-            auto rec = makeRecord(k, cfg, g);
-            table_.insert(k, rec);
-        }
-        bar.arrive_and_wait();
+void prepare() {
+    std::cout << "=== C++ YCSB Baseline Benchmark ===" << std::endl;
+    std::cout << "Records: " << kRecordCount << std::endl;
+    std::cout << "Threads: " << kNumMutatorThreads << std::endl;
+    std::cout << "Operations: Read(" << kReadProportion << ") Update(" << kUpdateProportion
+        << ") Insert(" << kInsertProportion << ") RMW(" << kRMWProportion << ")" << std::endl;
+    std::cout << "Request Distribution: " << kRequestDistribution << std::endl;
+    std::cout << "===================================" << std::endl;
+
+    // 分配keys数组
+    all_gen_keys = new Key[kRecordCount];
+
+    // 初始化随机数生成器
+    for (uint32_t i = 0; i < kNumMutatorThreads; i++) {
+        std::random_device rd;
+        generators[i].reset(new std::mt19937(rd()));
     }
 
-    void perfMonitor(const WorkloadConfig& cfg) {
-        auto t0 = std::chrono::steady_clock::now();
-        int64_t prev = 0;
-        std::ofstream out(outfile_, std::ios::app);
-        if (out) {
-            out << "\n=== MOPS Performance Measurements ===\nTime(s)\tMOPS\n";
-        }
+    // 数据加载
+    std::cout << "Loading " << kRecordCount << " records..." << std::endl;
+    auto load_start = microtime();
 
-        while (!stop_.load()) {
-            std::this_thread::sleep_for(std::chrono::seconds(WorkloadConfig::kMonitorIntervalSeconds));
-            auto now = std::chrono::steady_clock::now();
-            double elapsed = std::chrono::duration<double>(now - t0).count();
-            int64_t cur = total_ops_.load(std::memory_order_relaxed);
-            int64_t delta = cur - prev;
-            double mops = delta / (WorkloadConfig::kMonitorIntervalSeconds * 1e6);
-            {
-                std::lock_guard<std::mutex> lk(mops_mu_);
-                mops_.push_back(mops);
+    std::vector<std::thread> threads;
+    for (uint32_t tid = 0; tid < kNumMutatorThreads; tid++) {
+        threads.emplace_back([&, tid]() {
+            auto records_per_thread = kRecordCount / kNumMutatorThreads;
+            auto start_idx = tid * records_per_thread;
+            auto end_idx = start_idx + records_per_thread;
+            if (tid == kNumMutatorThreads - 1) {
+                end_idx = kRecordCount;
             }
-            std::cout << std::fixed << std::setprecision(3)
-                << "[" << std::setw(3) << int(elapsed) << "s] MOPS: " << mops << std::endl;
-            if (out) {
-                out << std::fixed << std::setprecision(1) << elapsed << "\t"
-                    << std::setprecision(3) << mops << "\n";
-                out.flush();
+
+            DistributionGenerator gen;
+            for (int64_t i = start_idx; i < end_idx; i++) {
+                Key key;
+                Value val;
+
+                KeyGenerator::generateKey(i, key.data, kKeyLen);
+                generateValue(val.data, kValueLen, gen);
+
+                table_ptr->put(std::string(key.data), std::string(val.data));
+                all_gen_keys[i] = key;
             }
-            prev = cur;
-            if (elapsed >= WorkloadConfig::kFixedRuntimeSeconds) {
-                stop_.store(true);
-                break;
-            }
+            });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    auto load_end = microtime();
+    auto load_time = (load_end - load_start) / 1000000.0;
+    std::cout << "Loaded in " << load_time << " seconds" << std::endl;
+
+    // 生成访问模式
+    DistributionGenerator gen;
+    if (kRequestDistribution == "zipfian") {
+        ZipfDistribution zipf(kRecordCount, kZipfParamS);
+        for (uint32_t i = 0; i < kReqSeqLenPerCore; i++) {
+            auto key_idx = zipf(*generators[0]);
+            all_zipf_key_indices[0][i] = key_idx;
+        }
+    }
+    else if (kRequestDistribution == "uniform") {
+        std::uniform_int_distribution<uint32_t> uniform_dist(0, kRecordCount - 1);
+        for (uint32_t i = 0; i < kReqSeqLenPerCore; i++) {
+            auto key_idx = uniform_dist(*generators[0]);
+            all_zipf_key_indices[0][i] = key_idx;
+        }
+    }
+    else if (kRequestDistribution == "latest") {
+        std::exponential_distribution<double> exp_dist(2.0);
+        for (uint32_t i = 0; i < kReqSeqLenPerCore; i++) {
+            int64_t offset = static_cast<int64_t>(exp_dist(*generators[0]));
+            auto key_idx = std::max(static_cast<int64_t>(0),
+                static_cast<int64_t>(kRecordCount) - 1 - offset % kRecordCount);
+            all_zipf_key_indices[0][i] = static_cast<uint32_t>(key_idx);
         }
     }
 
-    void benchWorker(const WorkloadConfig& cfg) {
-        DistributionGenerator g;
-        KeyGenerator kg(cfg.insertorder, cfg.zeropadding);
-        int64_t local_ops = 0; // flush batched
+    // 复制访问模式到所有线程
+    for (uint32_t k = 1; k < kNumMutatorThreads; k++) {
+        memcpy(all_zipf_key_indices[k], all_zipf_key_indices[0],
+            sizeof(uint32_t) * kReqSeqLenPerCore);
+    }
+}
 
-        while (!stop_.load(std::memory_order_relaxed)) {
-            double p = g.generateDouble();
-            double acc = 0.0;
+void monitor_perf() {
+    if (!flag.test_and_set()) {
+        auto us = microtime();
+        if (us - prev_us > kMinMonitorIntervalUs) {
+            uint64_t sum_cnts = 0;
+            for (uint32_t i = 0; i < kNumMutatorThreads; i++) {
+                sum_cnts += cnts[i].c;
+            }
+            us = microtime();
+            auto mops = (double)(sum_cnts - prev_sum_cnts) / (us - prev_us);
+            mops_vec.push_back(mops);
+            running_us += (us - prev_us);
 
-            if ((acc += cfg.readproportion) >= p) {
-                int64_t keynum = cfg.insertstart + g.generateKey(cfg.requestdistribution, cfg.insertcount);
-                std::string k = kg.generateKey(keynum);
-                Record r; table_.read(k, r, cfg.readallfields);
+            auto output = "[" + std::to_string(running_us / 1000000) + "s] MOPS: " +
+                std::to_string(mops) + " | Total Ops: " +
+                std::to_string(sum_cnts / 1000000) + "M";
+
+            std::cout << output << std::endl;
+            if (log_file.is_open()) {
+                log_file << output << std::endl;
+                log_file.flush();
             }
-            else if ((acc += cfg.updateproportion) >= p) {
-                int64_t keynum = cfg.insertstart + g.generateKey(cfg.requestdistribution, cfg.insertcount);
-                std::string k = kg.generateKey(keynum);
-                auto rec = makeRecord(k, cfg, g);
-                table_.update(k, rec, true);
-            }
-            else if ((acc += cfg.insertproportion) >= p) {
-                int64_t kn = cfg.insertstart + cfg.insertcount + global_insert_counter_.fetch_add(1);
-                std::string k = kg.generateKey(kn);
-                auto rec = makeRecord(k, cfg, g);
-                table_.insert(k, rec);
-            }
-            else if ((acc += cfg.scanproportion) >= p) {
-                int64_t keynum = cfg.insertstart + g.generateKey(cfg.requestdistribution, cfg.insertcount);
-                std::string startk = kg.generateKey(keynum);
-                int scan_len = g.generateScanLength(cfg.scanlengthdistribution, cfg.minscanlength, cfg.maxscanlength);
-                std::vector<Record> res; table_.scan(startk, scan_len, res);
-            }
-            else if ((acc += cfg.readmodifywriteproportion) >= p) {
-                int64_t keynum = cfg.insertstart + g.generateKey(cfg.requestdistribution, cfg.insertcount);
-                std::string k = kg.generateKey(keynum);
-                Record r; if (table_.read(k, r, true)) {
-                    auto rec = makeRecord(k, cfg, g);
-                    table_.update(k, rec, true);
+
+            if (running_us >= kMaxRunningUs) {
+                std::vector<double> last_5_mops(
+                    mops_vec.end() - std::min(static_cast<int>(mops_vec.size()), 5),
+                    mops_vec.end());
+                auto final_mops = std::accumulate(last_5_mops.begin(), last_5_mops.end(), 0.0) / last_5_mops.size();
+
+                std::cout << "mops = " << final_mops << std::endl;
+                if (log_file.is_open()) {
+                    log_file << "mops = " << final_mops << std::endl;
+                    log_file.close();
                 }
+                exit(0);
             }
-
-            if (++local_ops == 1024) {
-                total_ops_.fetch_add(local_ops, std::memory_order_relaxed);
-                local_ops = 0;
-            }
+            prev_us = us;
+            prev_sum_cnts = sum_cnts;
         }
-        if (local_ops) total_ops_.fetch_add(local_ops, std::memory_order_relaxed);
+        flag.clear();
     }
+}
 
-public:
-    explicit MultiThreadedYCSBBenchmark(std::string out = "multithreaded_ycsb_mops_results.txt",
-        size_t stripes = 1024)
-        : table_(stripes), outfile_(std::move(out)) {}
+void bench_ycsb_operations() {
+    prev_us = microtime();
+    std::vector<std::thread> threads;
 
-    static WorkloadConfig parseConfig(const std::string& file) {
-        WorkloadConfig c;
-        std::ifstream f(file);
-        if (!f.is_open()) {
-            std::cerr << "Warning: cannot open " << file << ", using defaults\n";
-            c.insertcount = (c.insertcount == -1) ? c.recordcount : c.insertcount;
-            return c;
-        }
-        std::string line;
-        while (std::getline(f, line)) {
-            line.erase(std::remove_if(line.begin(), line.end(), ::isspace), line.end());
-            if (line.empty() || line[0] == '#') continue;
-            auto pos = line.find('='); if (pos == std::string::npos) continue;
-            auto key = line.substr(0, pos); auto val = line.substr(pos + 1);
-            if (key == "recordcount") c.recordcount = std::stoll(val);
-            else if (key == "fieldcount") c.fieldcount = std::stoi(val);
-            else if (key == "fieldlength") c.fieldlength = std::stoi(val);
-            else if (key == "minfieldlength") c.minfieldlength = std::stoi(val);
-            else if (key == "fieldlengthdistribution") c.fieldlengthdistribution = val;
-            else if (key == "fieldnameprefix") c.fieldnameprefix = val;
-            else if (key == "readallfields") c.readallfields = (val == "true");
-            else if (key == "readproportion") c.readproportion = std::stod(val);
-            else if (key == "updateproportion") c.updateproportion = std::stod(val);
-            else if (key == "scanproportion") c.scanproportion = std::stod(val);
-            else if (key == "insertproportion") c.insertproportion = std::stod(val);
-            else if (key == "readmodifywriteproportion") c.readmodifywriteproportion = std::stod(val);
-            else if (key == "requestdistribution") c.requestdistribution = val;
-            else if (key == "insertorder") c.insertorder = val;
-            else if (key == "maxscanlength") c.maxscanlength = std::stoi(val);
-            else if (key == "minscanlength") c.minscanlength = std::stoi(val);
-            else if (key == "scanlengthdistribution") c.scanlengthdistribution = val;
-            else if (key == "zeropadding") c.zeropadding = std::stoi(val);
-            else if (key == "insertstart") c.insertstart = std::stoll(val);
-            else if (key == "insertcount") c.insertcount = std::stoll(val);
-            else if (key == "threadcount") c.threadcount = std::stoi(val);
-        }
-        if (c.insertcount == -1) c.insertcount = c.recordcount;
-        return c;
-    }
+    for (uint32_t tid = 0; tid < kNumMutatorThreads; tid++) {
+        threads.emplace_back([&, tid]() {
+            uint32_t cnt = 0;
+            DistributionGenerator gen;
 
-    void run(const WorkloadConfig& cfg) {
-        // Reset state
-        table_.clear();
-        total_ops_.store(0);
-        global_insert_counter_.store(0);
-        stop_.store(false);
-        mops_.clear();
+            while (1) {
+                if (cnt++ % kMonitorPerIter == 0) {
+                    monitor_perf();
+                }
+                auto key_idx = all_zipf_key_indices[tid][per_core_req_idx++];
+                if (per_core_req_idx == kReqSeqLenPerCore) {
+                    per_core_req_idx = 0;
+                }
 
-        // Pre-reserve capacity across stripes to reduce rehash under lock.
-        table_.reserve(cfg.insertcount);
+                double op_selector = gen.generateDouble();
+                double cumulative = 0.0;
 
-        // Load phase (true parallel)
-        {
-            SimpleBarrier bar(cfg.threadcount);
-            std::vector<std::thread> ths;
-            auto start = std::chrono::high_resolution_clock::now();
-            for (int i = 0; i < cfg.threadcount; ++i) ths.emplace_back(&MultiThreadedYCSBBenchmark::loadWorker, this, std::cref(cfg), i, cfg.threadcount, std::ref(bar));
-            for (auto& t : ths) t.join();
-            auto end = std::chrono::high_resolution_clock::now();
-            double sec = std::chrono::duration<double>(end - start).count();
-            std::cout << "Loaded " << table_.size() << " records in " << std::fixed << std::setprecision(2)
-                << sec << " s (" << std::setprecision(0) << (cfg.insertcount / sec) << " ops/s)\n";
-        }
+                if ((cumulative += kReadProportion) >= op_selector) {
+                    // READ
+                    auto& key = all_gen_keys[key_idx];
+                    std::string val;
+                    table_ptr->get(std::string(key.data), val);
+                    volatile char dummy = val.empty() ? 0 : val[0];
+                    (void)dummy;
+                }
+                else if ((cumulative += kUpdateProportion) >= op_selector) {
+                    // UPDATE
+                    auto& key = all_gen_keys[key_idx];
+                    Value val;
+                    generateValue(val.data, kValueLen, gen);
+                    table_ptr->put(std::string(key.data), std::string(val.data));
+                }
+                else if ((cumulative += kInsertProportion) >= op_selector) {
+                    // INSERT
+                    int64_t insert_keynum = kRecordCount + global_insert_counter.fetch_add(1);
+                    Key new_key;
+                    KeyGenerator::generateKey(insert_keynum, new_key.data, kKeyLen);
+                    Value val;
+                    generateValue(val.data, kValueLen, gen);
+                    table_ptr->put(std::string(new_key.data), std::string(val.data));
+                }
+                else if ((cumulative += kRMWProportion) >= op_selector) {
+                    // READ-MODIFY-WRITE
+                    auto& key = all_gen_keys[key_idx];
+                    std::string val;
+                    if (table_ptr->get(std::string(key.data), val)) {
+                        Value new_val;
+                        generateValue(new_val.data, kValueLen, gen);
+                        table_ptr->put(std::string(key.data), std::string(new_val.data));
+                    }
+                }
 
-        // Open results file header
-        {
-            std::ofstream out(outfile_);
-            if (out) {
-                auto now = std::chrono::system_clock::now(); auto tt = std::chrono::system_clock::to_time_t(now);
-                out << "Multithreaded YCSB MOPS Benchmark Results\n";
-                out << "Generated at: " << std::put_time(std::localtime(&tt), "%Y-%m-%d %H:%M:%S") << "\n";
-                out << "Threads: " << cfg.threadcount << "\n";
-                out << "Records: " << cfg.recordcount << "\n";
-                out << "Distribution: " << cfg.requestdistribution << "\n";
-                out << "Runtime: " << WorkloadConfig::kFixedRuntimeSeconds << " seconds\n";
-                out << std::string(50, '=') << "\n";
+                cnts[tid].c++;
             }
-        }
-
-        // Run phase (true 400-thread concurrency)
-        std::cout << "Starting " << WorkloadConfig::kFixedRuntimeSeconds << "s benchmark with "
-            << cfg.threadcount << " threads...\n";
-        std::vector<std::thread> workers; workers.reserve(cfg.threadcount);
-        std::thread monitor(&MultiThreadedYCSBBenchmark::perfMonitor, this, std::cref(cfg));
-        for (int i = 0; i < cfg.threadcount; ++i) workers.emplace_back(&MultiThreadedYCSBBenchmark::benchWorker, this, std::cref(cfg));
-
-        monitor.join(); // sets stop_ when time is up
-        for (auto& t : workers) t.join();
-
-        // Summaries
-        int64_t total_ops = total_ops_.load();
-        double avg_mops = 0.0;
-        {
-            std::lock_guard<std::mutex> lk(mops_mu_);
-            if (!mops_.empty()) {
-                size_t warm = std::min<size_t>(3, mops_.size());
-                double sum = std::accumulate(mops_.begin() + warm, mops_.end(), 0.0);
-                size_t denom = (mops_.size() - warm);
-                avg_mops = denom ? (sum / denom) : 0.0;
-            }
-        }
-
-        std::cout << std::fixed << std::setprecision(3)
-            << "Benchmark done. Total ops: " << total_ops
-            << ", Avg MOPS (excl warmup): " << avg_mops << "\n";
-
-        std::ofstream out(outfile_, std::ios::app);
-        if (out) {
-            out << "\n=== Final Results ===\n";
-            out << "Total Operations: " << total_ops << "\n";
-            out << std::fixed << std::setprecision(3)
-                << "Average MOPS (excluding warmup): " << avg_mops << "\n";
-            out << "Final HashTable Size: " << table_.size() << "\n";
-        }
+            });
     }
-};
+    for (auto& thread : threads) {
+        thread.join();
+    }
+}
 
-// =========================
-// CLI
-// =========================
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <workload_file> [--out file] [--stripes N]\n";
-        return 1;
-    }
-    std::string workload = argv[1];
-    std::string out = workload + std::string("_mops_results.txt");
-    size_t stripes = 1024;
-    for (int i = 2; i < argc; ++i) {
-        std::string a = argv[i];
-        if (a == "--out" && i + 1 < argc) out = argv[++i];
-        else if (a == "--stripes" && i + 1 < argc) stripes = std::stoul(argv[++i]);
+    if (argc >= 2) {
+        parseWorkloadFile(argv[1]);
+        std::string workload_file = argv[1];
+        std::string log_filename = "cpp_" + workload_file.substr(0, workload_file.find('.')) + ".log";
+        log_file.open(log_filename);
     }
 
-    auto cfg = MultiThreadedYCSBBenchmark::parseConfig(workload);
-    // force 400 threads unless workload overrides (keeps your original intent)
-    if (cfg.threadcount <= 0) cfg.threadcount = 400;
+    ConcurrentHashTable table(2048);
+    table_ptr = &table;
 
-    MultiThreadedYCSBBenchmark bench(out, stripes);
-    bench.run(cfg);
+    std::cout << "Prepare..." << std::endl;
+    prepare();
+    std::cout << "YCSB Operations..." << std::endl;
+    bench_ycsb_operations();
+
     return 0;
 }
