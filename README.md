@@ -1,8 +1,8 @@
-25/08/13 更新benchmark：改为400线程+记录运行前4min的MOPS(每10s记录一次)
+25/08/13 更新benchmark：改为400线程+记录运行前200s的MOPS(每10s记录一次)
 
 ```Bash
-g++ -std=c++14 -O3 -pthread mops_benchmark.cpp -o mops_benchmark
-./mops_benchmark workloada.txt
+g++ -O2 -std=c++17 -pthread -o cpp_ycsb_benchmark mops_benchmark.cpp
+./cpp_ycsb_benchmark workloadb.txt
 ```
 
 ===========================================
@@ -250,6 +250,7 @@ chmod 600 /root/.ssh/id_rsa
 
 
 待更新
+
 
 
 
