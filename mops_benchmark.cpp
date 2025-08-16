@@ -15,8 +15,10 @@
 #include <iomanip>
 #include <mutex>
 #include <shared_mutex>
+#include <string_view> // Include for string_view
+#include <numeric>     // Include for std::accumulate
 
-// 全局参数 - 会被workload文件覆盖
+// Global parameters - will be overwritten by the workload file
 static double kReadProportion = 0.5;
 static double kUpdateProportion = 0.5;
 static double kInsertProportion = 0.0;
@@ -24,15 +26,17 @@ static double kScanProportion = 0.0;
 static double kRMWProportion = 0.0;
 static std::string kRequestDistribution = "zipfian";
 
-// 固定参数
+// Fixed parameters
 constexpr static int64_t kRecordCount = 128000000;
+// Pre-allocate 10% extra space for INSERT operations
+constexpr static int64_t kPaddedRecordCount = static_cast<int64_t>(kRecordCount * 1.1);
 constexpr static uint32_t kKeyLen = 32;
 constexpr static uint32_t kValueLen = 64;
 constexpr static uint32_t kNumMutatorThreads = 400;
 constexpr static uint32_t kReqSeqLenPerCore = 1 << 20; // 1M per core
 constexpr static uint32_t kMonitorPerIter = 1024;
-constexpr static uint32_t kMinMonitorIntervalUs = 10 * 1000 * 1000; // 10秒
-constexpr static uint32_t kMaxRunningUs = 200 * 1000 * 1000; // 200秒
+constexpr static uint32_t kMinMonitorIntervalUs = 10 * 1000 * 1000; // 10 seconds
+constexpr static uint32_t kMaxRunningUs = 200 * 1000 * 1000; // 200 seconds
 constexpr static double kZipfParamS = 0.8;
 
 // FNV Hash
@@ -41,7 +45,6 @@ public:
     static uint64_t hash(uint64_t val) {
         const uint64_t FNV_OFFSET_BASIS = 0xCBF29CE484222325ULL;
         const uint64_t FNV_PRIME = 1099511628211ULL;
-
         uint64_t hashval = FNV_OFFSET_BASIS;
         for (int i = 0; i < 8; i++) {
             uint8_t octet = val & 0x00ff;
@@ -53,12 +56,11 @@ public:
     }
 };
 
-// Zipf分布
+// Zipf Distribution
 class ZipfDistribution {
 private:
     std::vector<double> prob_;
     std::discrete_distribution<int64_t> dist_;
-
 public:
     ZipfDistribution(int64_t n, double s) {
         prob_.resize(n);
@@ -70,20 +72,17 @@ public:
         for (auto& p : prob_) p /= sum;
         dist_ = std::discrete_distribution<int64_t>(prob_.begin(), prob_.end());
     }
-
     template<class Gen>
     int64_t operator()(Gen& gen) { return dist_(gen); }
 };
 
-// 分布生成器
+// Distribution Generator
 class DistributionGenerator {
 private:
     std::mt19937 gen;
     std::uniform_real_distribution<double> uniform_dist{ 0.0, 1.0 };
-
 public:
     DistributionGenerator() : gen(std::random_device{}()) {}
-
     int64_t generateKey(const std::string& distribution, int64_t range) {
         if (distribution == "zipfian") {
             ZipfDistribution zipf(range, kZipfParamS);
@@ -103,13 +102,10 @@ public:
             return dist(gen);
         }
     }
-
-    double generateDouble() {
-        return uniform_dist(gen);
-    }
+    double generateDouble() { return uniform_dist(gen); }
 };
 
-// 键生成器
+// Key Generator
 class KeyGenerator {
 public:
     static void generateKey(int64_t keynum, char* key_data, uint32_t key_len) {
@@ -120,7 +116,7 @@ public:
     }
 };
 
-// 数据结构
+// Data Structures
 struct Key {
     char data[kKeyLen];
 };
@@ -133,11 +129,12 @@ struct alignas(64) Cnt {
     uint64_t c;
 };
 
-// 并发哈希表
+// **Modified** Concurrent Hash Table
 class ConcurrentHashTable {
 private:
     struct Bucket {
-        std::unordered_map<std::string, std::string> data;
+        // Use string_view to avoid data copying
+        std::unordered_map<std::string_view, std::string_view> data;
         mutable std::shared_mutex mtx;
         char padding[64];
     };
@@ -145,8 +142,8 @@ private:
     std::vector<std::unique_ptr<Bucket>> buckets_;
     size_t mask_;
 
-    size_t getBucket(const std::string& key) const {
-        return std::hash<std::string>{}(key)&mask_;
+    size_t getBucket(std::string_view key) const {
+        return std::hash<std::string_view>{}(key)&mask_;
     }
 
 public:
@@ -161,13 +158,26 @@ public:
         mask_ = actual - 1;
     }
 
-    void put(const std::string& key, const std::string& value) {
+    void put(std::string_view key, std::string_view value) {
         auto& bucket = *buckets_[getBucket(key)];
         std::unique_lock<std::shared_mutex> lock(bucket.mtx);
         bucket.data[key] = value;
     }
 
-    bool get(const std::string& key, std::string& value) {
+    // **Added**: For Update/RMW operations, directly modify the Value's memory
+    void update(std::string_view key, const char* new_value_data, size_t new_value_len) {
+        auto& bucket = *buckets_[getBucket(key)];
+        std::unique_lock<std::shared_mutex> lock(bucket.mtx);
+        auto it = bucket.data.find(key);
+        if (it != bucket.data.end()) {
+            // it->second is a string_view, its data() returns a const char*
+            // We cast away constness to modify the memory it points to
+            char* dest = const_cast<char*>(it->second.data());
+            memcpy(dest, new_value_data, std::min((size_t)kValueLen, new_value_len));
+        }
+    }
+
+    bool get(std::string_view key, std::string_view& value) {
         auto& bucket = *buckets_[getBucket(key)];
         std::shared_lock<std::shared_mutex> lock(bucket.mtx);
         auto it = bucket.data.find(key);
@@ -188,18 +198,20 @@ public:
     }
 };
 
-// 全局变量
+// Global variables
 std::atomic_flag flag;
 std::unique_ptr<std::mt19937> generators[kNumMutatorThreads];
 thread_local uint32_t per_core_req_idx = 0;
 Key* all_gen_keys;
+Value* all_gen_values; // **Added**: Unified storage for Values
 uint32_t all_zipf_key_indices[kNumMutatorThreads][kReqSeqLenPerCore];
 Cnt cnts[kNumMutatorThreads];
 std::vector<double> mops_vec;
 uint64_t prev_sum_cnts = 0;
 uint64_t prev_us = 0;
 uint64_t running_us = 0;
-std::atomic<int64_t> global_insert_counter{ 0 };
+// Atomic counter starts from kRecordCount to assign indices for new inserts
+std::atomic<int64_t> global_insert_idx{ kRecordCount };
 ConcurrentHashTable* table_ptr;
 std::ofstream log_file;
 
@@ -216,7 +228,7 @@ void generateValue(char* data, uint32_t len, DistributionGenerator& gen) {
     data[len - 1] = '\0';
 }
 
-// workload文件解析
+// Parse workload file
 void parseWorkloadFile(const std::string& filename) {
     std::ifstream file(filename);
     if (!file.is_open()) {
@@ -227,7 +239,7 @@ void parseWorkloadFile(const std::string& filename) {
     std::cout << "Parsing " << filename << std::endl;
     std::string line;
     while (std::getline(file, line)) {
-        // 移除空格
+        // Remove whitespace
         line.erase(std::remove_if(line.begin(), line.end(), ::isspace), line.end());
         if (line.empty() || line[0] == '#') continue;
 
@@ -237,24 +249,12 @@ void parseWorkloadFile(const std::string& filename) {
         auto key = line.substr(0, eq_pos);
         auto value = line.substr(eq_pos + 1);
 
-        if (key == "readproportion") {
-            kReadProportion = std::stod(value);
-        }
-        else if (key == "updateproportion") {
-            kUpdateProportion = std::stod(value);
-        }
-        else if (key == "insertproportion") {
-            kInsertProportion = std::stod(value);
-        }
-        else if (key == "scanproportion") {
-            kScanProportion = std::stod(value);
-        }
-        else if (key == "readmodifywriteproportion") {
-            kRMWProportion = std::stod(value);
-        }
-        else if (key == "requestdistribution") {
-            kRequestDistribution = value;
-        }
+        if (key == "readproportion") kReadProportion = std::stod(value);
+        else if (key == "updateproportion") kUpdateProportion = std::stod(value);
+        else if (key == "insertproportion") kInsertProportion = std::stod(value);
+        else if (key == "scanproportion") kScanProportion = std::stod(value);
+        else if (key == "readmodifywriteproportion") kRMWProportion = std::stod(value);
+        else if (key == "requestdistribution") kRequestDistribution = value;
     }
 
     std::cout << "Loaded: Read=" << kReadProportion << " Update=" << kUpdateProportion
@@ -264,23 +264,24 @@ void parseWorkloadFile(const std::string& filename) {
 
 void prepare() {
     std::cout << "=== C++ YCSB Baseline Benchmark ===" << std::endl;
-    std::cout << "Records: " << kRecordCount << std::endl;
+    std::cout << "Records: " << kRecordCount << " (Padded: " << kPaddedRecordCount << ")" << std::endl;
     std::cout << "Threads: " << kNumMutatorThreads << std::endl;
     std::cout << "Operations: Read(" << kReadProportion << ") Update(" << kUpdateProportion
         << ") Insert(" << kInsertProportion << ") RMW(" << kRMWProportion << ")" << std::endl;
     std::cout << "Request Distribution: " << kRequestDistribution << std::endl;
     std::cout << "===================================" << std::endl;
 
-    // 分配keys数组
-    all_gen_keys = new Key[kRecordCount];
+    // Allocate arrays for keys and values
+    all_gen_keys = new Key[kPaddedRecordCount];
+    all_gen_values = new Value[kPaddedRecordCount];
 
-    // 初始化随机数生成器
+    // Initialize random number generators
     for (uint32_t i = 0; i < kNumMutatorThreads; i++) {
         std::random_device rd;
         generators[i].reset(new std::mt19937(rd()));
     }
 
-    // 数据加载
+    // Data loading
     std::cout << "Loading " << kRecordCount << " records..." << std::endl;
     auto load_start = microtime();
 
@@ -296,14 +297,14 @@ void prepare() {
 
             DistributionGenerator gen;
             for (int64_t i = start_idx; i < end_idx; i++) {
-                Key key;
-                Value val;
+                // Generate data directly into the pre-allocated arrays
+                KeyGenerator::generateKey(i, all_gen_keys[i].data, kKeyLen);
+                generateValue(all_gen_values[i].data, kValueLen, gen);
 
-                KeyGenerator::generateKey(i, key.data, kKeyLen);
-                generateValue(val.data, kValueLen, gen);
-
-                table_ptr->put(std::string(key.data), std::string(val.data));
-                all_gen_keys[i] = key;
+                // Insert using string_view, no data copy involved
+                std::string_view key_sv(all_gen_keys[i].data, strnlen(all_gen_keys[i].data, kKeyLen));
+                std::string_view val_sv(all_gen_values[i].data, strnlen(all_gen_values[i].data, kValueLen));
+                table_ptr->put(key_sv, val_sv);
             }
             });
     }
@@ -315,7 +316,7 @@ void prepare() {
     auto load_time = (load_end - load_start) / 1000000.0;
     std::cout << "Loaded in " << load_time << " seconds" << std::endl;
 
-    // 生成访问模式
+    // Generate access patterns
     DistributionGenerator gen;
     if (kRequestDistribution == "zipfian") {
         ZipfDistribution zipf(kRecordCount, kZipfParamS);
@@ -341,7 +342,7 @@ void prepare() {
         }
     }
 
-    // 复制访问模式到所有线程
+    // Copy access patterns to all threads
     for (uint32_t k = 1; k < kNumMutatorThreads; k++) {
         memcpy(all_zipf_key_indices[k], all_zipf_key_indices[0],
             sizeof(uint32_t) * kReqSeqLenPerCore);
@@ -375,7 +376,10 @@ void monitor_perf() {
                 std::vector<double> last_5_mops(
                     mops_vec.end() - std::min(static_cast<int>(mops_vec.size()), 5),
                     mops_vec.end());
-                auto final_mops = std::accumulate(last_5_mops.begin(), last_5_mops.end(), 0.0) / last_5_mops.size();
+                double final_mops = 0.0;
+                if (!last_5_mops.empty()) {
+                    final_mops = std::accumulate(last_5_mops.begin(), last_5_mops.end(), 0.0) / last_5_mops.size();
+                }
 
                 std::cout << "mops = " << final_mops << std::endl;
                 if (log_file.is_open()) {
@@ -401,49 +405,48 @@ void bench_ycsb_operations() {
             DistributionGenerator gen;
 
             while (1) {
-                if (cnt++ % kMonitorPerIter == 0) {
-                    monitor_perf();
-                }
+                if (cnt++ % kMonitorPerIter == 0) monitor_perf();
+
                 auto key_idx = all_zipf_key_indices[tid][per_core_req_idx++];
-                if (per_core_req_idx == kReqSeqLenPerCore) {
-                    per_core_req_idx = 0;
-                }
+                if (per_core_req_idx == kReqSeqLenPerCore) per_core_req_idx = 0;
 
                 double op_selector = gen.generateDouble();
                 double cumulative = 0.0;
 
+                Key& key_ref = all_gen_keys[key_idx];
+                std::string_view key_sv(key_ref.data, strnlen(key_ref.data, kKeyLen));
+
                 if ((cumulative += kReadProportion) >= op_selector) {
                     // READ
-                    auto& key = all_gen_keys[key_idx];
-                    std::string val;
-                    table_ptr->get(std::string(key.data), val);
-                    volatile char dummy = val.empty() ? 0 : val[0];
-                    (void)dummy;
+                    std::string_view val_sv;
+                    table_ptr->get(key_sv, val_sv);
                 }
                 else if ((cumulative += kUpdateProportion) >= op_selector) {
                     // UPDATE
-                    auto& key = all_gen_keys[key_idx];
-                    Value val;
-                    generateValue(val.data, kValueLen, gen);
-                    table_ptr->put(std::string(key.data), std::string(val.data));
+                    Value new_val;
+                    generateValue(new_val.data, kValueLen, gen);
+                    table_ptr->update(key_sv, new_val.data, kValueLen);
                 }
                 else if ((cumulative += kInsertProportion) >= op_selector) {
                     // INSERT
-                    int64_t insert_keynum = kRecordCount + global_insert_counter.fetch_add(1);
-                    Key new_key;
-                    KeyGenerator::generateKey(insert_keynum, new_key.data, kKeyLen);
-                    Value val;
-                    generateValue(val.data, kValueLen, gen);
-                    table_ptr->put(std::string(new_key.data), std::string(val.data));
+                    int64_t insert_idx = global_insert_idx.fetch_add(1);
+                    if (insert_idx < kPaddedRecordCount) {
+                        // Generate new data in the pre-allocated space
+                        KeyGenerator::generateKey(insert_idx, all_gen_keys[insert_idx].data, kKeyLen);
+                        generateValue(all_gen_values[insert_idx].data, kValueLen, gen);
+
+                        std::string_view new_key_sv(all_gen_keys[insert_idx].data, strnlen(all_gen_keys[insert_idx].data, kKeyLen));
+                        std::string_view new_val_sv(all_gen_values[insert_idx].data, strnlen(all_gen_values[insert_idx].data, kValueLen));
+                        table_ptr->put(new_key_sv, new_val_sv);
+                    }
                 }
                 else if ((cumulative += kRMWProportion) >= op_selector) {
                     // READ-MODIFY-WRITE
-                    auto& key = all_gen_keys[key_idx];
-                    std::string val;
-                    if (table_ptr->get(std::string(key.data), val)) {
+                    std::string_view val_sv;
+                    if (table_ptr->get(key_sv, val_sv)) {
                         Value new_val;
                         generateValue(new_val.data, kValueLen, gen);
-                        table_ptr->put(std::string(key.data), std::string(new_val.data));
+                        table_ptr->update(key_sv, new_val.data, kValueLen);
                     }
                 }
 
@@ -471,6 +474,10 @@ int main(int argc, char* argv[]) {
     prepare();
     std::cout << "YCSB Operations..." << std::endl;
     bench_ycsb_operations();
+
+    // Clean up globally allocated memory
+    delete[] all_gen_keys;
+    delete[] all_gen_values;
 
     return 0;
 }
