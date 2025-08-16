@@ -30,12 +30,13 @@ static std::string kRequestDistribution = "zipfian";
 constexpr static int64_t kRecordCount = 128000000;
 constexpr static uint32_t kKeyLen = 32;
 constexpr static uint32_t kValueLen = 64;
-constexpr static uint32_t kNumMutatorThreads = 400;
+constexpr static uint32_t kNumMutatorThreads = 20;
 constexpr static uint32_t kReqSeqLenPerCore = 1 << 20; // 1M per core
 constexpr static uint32_t kMonitorPerIter = 1024;
 constexpr static uint32_t kMinMonitorIntervalUs = 10 * 1000 * 1000; // 10 seconds
 constexpr static uint32_t kMaxRunningUs = 200 * 1000 * 1000; // 200 seconds
 constexpr static double kZipfParamS = 0.8;
+constexpr static size_t kNumBuckets = 1 << 12; // 262144 buckets
 
 // FNV Hash
 class FNVHash {
@@ -54,13 +55,13 @@ public:
     }
 };
 
-// Zipf Distribution
 class ZipfDistribution {
 private:
     std::vector<double> prob_;
     std::discrete_distribution<int64_t> dist_;
 public:
     ZipfDistribution(int64_t n, double s) {
+        if (n <= 0) return;
         prob_.resize(n);
         double sum = 0.0;
         for (int64_t i = 1; i <= n; ++i) {
@@ -74,36 +75,15 @@ public:
     int64_t operator()(Gen& gen) { return dist_(gen); }
 };
 
-// Distribution Generator
-class DistributionGenerator {
+class RandomGenerator {
 private:
     std::mt19937 gen;
     std::uniform_real_distribution<double> uniform_dist{ 0.0, 1.0 };
 public:
-    DistributionGenerator() : gen(std::random_device{}()) {}
-    int64_t generateKey(const std::string& distribution, int64_t range) {
-        if (distribution == "zipfian") {
-            ZipfDistribution zipf(range, kZipfParamS);
-            return zipf(gen);
-        }
-        else if (distribution == "latest") {
-            std::exponential_distribution<double> exp_dist(2.0);
-            int64_t offset = static_cast<int64_t>(exp_dist(gen));
-            return std::max(static_cast<int64_t>(0), range - 1 - offset % range);
-        }
-        else if (distribution == "sequential") {
-            static std::atomic<int64_t> seq_counter{ 0 };
-            return (seq_counter++) % range;
-        }
-        else { // uniform
-            std::uniform_int_distribution<int64_t> dist(0, range - 1);
-            return dist(gen);
-        }
-    }
+    RandomGenerator() : gen(std::random_device{}()) {}
     double generateDouble() { return uniform_dist(gen); }
 };
 
-// Key Generator
 class KeyGenerator {
 public:
     static void generateKey(int64_t keynum, char* key_data, uint32_t key_len) {
@@ -114,16 +94,9 @@ public:
     }
 };
 
-// Data Structures
-struct Key {
-    char data[kKeyLen];
-};
+struct Key { char data[kKeyLen]; };
+struct Value { char data[kValueLen]; };
 
-struct Value {
-    char data[kValueLen];
-};
-
-// Custom hasher and equality checker for Key pointers
 struct KeyHasher {
     std::size_t operator()(const Key* k) const {
         return std::hash<std::string_view>{}(std::string_view(k->data, strnlen(k->data, kKeyLen)));
@@ -137,11 +110,8 @@ struct KeyEqualTo {
     }
 };
 
-struct alignas(64) Cnt {
-    uint64_t c;
-};
+struct alignas(64) Cnt { uint64_t c; };
 
-// Concurrent Hash Table for low-memory environments
 class ConcurrentHashTable {
 private:
     struct Bucket {
@@ -149,32 +119,24 @@ private:
         mutable std::shared_mutex mtx;
         char padding[64];
     };
-
     std::vector<std::unique_ptr<Bucket>> buckets_;
     size_t mask_;
-
-    size_t getBucket(const Key* key) const {
-        return KeyHasher{}(key)&mask_;
-    }
-
+    size_t getBucket(const Key* key) const { return KeyHasher{}(key)&mask_; }
 public:
-    ConcurrentHashTable(size_t num_buckets = 2048) {
+    ConcurrentHashTable(size_t num_buckets) {
         size_t actual = 1;
         while (actual < num_buckets) actual <<= 1;
-
         buckets_.reserve(actual);
         for (size_t i = 0; i < actual; ++i) {
             buckets_.push_back(std::make_unique<Bucket>());
         }
         mask_ = actual - 1;
     }
-
     void put(const Key* key, Value* value) {
         auto& bucket = *buckets_[getBucket(key)];
         std::unique_lock<std::shared_mutex> lock(bucket.mtx);
         bucket.data[key] = value;
     }
-
     void update(const Key* key, const char* new_value_data) {
         auto& bucket = *buckets_[getBucket(key)];
         std::unique_lock<std::shared_mutex> lock(bucket.mtx);
@@ -183,28 +145,13 @@ public:
             memcpy(it->second->data, new_value_data, kValueLen);
         }
     }
-
     bool get(const Key* key, Value*& value) {
         auto& bucket = *buckets_[getBucket(key)];
         std::shared_lock<std::shared_mutex> lock(bucket.mtx);
         auto it = bucket.data.find(key);
-        if (it != bucket.data.end()) {
-            value = it->second;
-            return true;
-        }
+        if (it != bucket.data.end()) { value = it->second; return true; }
         return false;
     }
-
-    size_t size() const {
-        size_t total = 0;
-        for (const auto& bucket_ptr : buckets_) {
-            std::shared_lock<std::shared_mutex> lock(bucket_ptr->mtx);
-            total += bucket_ptr->data.size();
-        }
-        return total;
-    }
-
-    // Method to clean up all dynamically allocated memory
     void clear() {
         for (auto& bucket_ptr : buckets_) {
             std::unique_lock<std::shared_mutex> lock(bucket_ptr->mtx);
@@ -219,11 +166,9 @@ public:
 
 // Global variables
 std::atomic_flag flag;
-std::unique_ptr<std::mt19937> generators[kNumMutatorThreads];
-thread_local uint32_t per_core_req_idx = 0;
-// Vector of pointers to keys, used for picking keys during benchmark
 std::vector<const Key*> key_pointers_for_test;
-uint32_t all_zipf_key_indices[kNumMutatorThreads][kReqSeqLenPerCore];
+// MODIFICATION: A single, small, shared vector for key access indices. ~4MB.
+std::vector<uint32_t> shared_key_indices;
 Cnt cnts[kNumMutatorThreads];
 std::vector<double> mops_vec;
 uint64_t prev_sum_cnts = 0;
@@ -232,13 +177,15 @@ uint64_t running_us = 0;
 std::atomic<int64_t> global_insert_counter{ kRecordCount };
 ConcurrentHashTable* table_ptr;
 std::ofstream log_file;
+thread_local uint32_t per_core_req_idx = 0; // Each thread has its own index into the shared array
+
 
 uint64_t microtime() {
     auto now = std::chrono::high_resolution_clock::now();
     return std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
 }
 
-void generateValue(char* data, uint32_t len, DistributionGenerator& gen) {
+void generateValue(char* data, uint32_t len, RandomGenerator& gen) {
     const std::string chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     for (uint32_t i = 0; i < len; ++i) {
         data[i] = chars[static_cast<size_t>(gen.generateDouble() * chars.length())];
@@ -246,6 +193,157 @@ void generateValue(char* data, uint32_t len, DistributionGenerator& gen) {
     data[len - 1] = '\0';
 }
 
+void parseWorkloadFile(const std::string& filename); // Definition at the end
+
+void prepare() {
+    std::cout << "=== C++ YCSB Baseline Benchmark (Low-Memory Mode) ===" << std::endl;
+    std::cout << "Records: " << kRecordCount << std::endl;
+    std::cout << "Threads: " << kNumMutatorThreads << std::endl;
+    std::cout << "Request Distribution: " << kRequestDistribution << std::endl;
+    std::cout << "=====================================================" << std::endl;
+
+    std::cout << "Loading " << kRecordCount << " records (lock-free parallel load)..." << std::endl;
+    auto load_start = microtime();
+
+    std::vector<std::thread> threads;
+    std::vector<std::vector<const Key*>> local_key_pointers(kNumMutatorThreads);
+
+    for (uint32_t tid = 0; tid < kNumMutatorThreads; tid++) {
+        threads.emplace_back([&, tid]() {
+            auto records_per_thread = kRecordCount / kNumMutatorThreads;
+            auto start_idx = tid * records_per_thread;
+            auto end_idx = (tid == kNumMutatorThreads - 1) ? kRecordCount : start_idx + records_per_thread;
+
+            RandomGenerator gen;
+            local_key_pointers[tid].reserve(end_idx - start_idx);
+
+            for (int64_t i = start_idx; i < end_idx; i++) {
+                Key* new_key = new Key();
+                Value* new_val = new Value();
+                KeyGenerator::generateKey(i, new_key->data, kKeyLen);
+                generateValue(new_val->data, kValueLen, gen);
+                table_ptr->put(new_key, new_val);
+                local_key_pointers[tid].push_back(new_key);
+            }
+            });
+    }
+    for (auto& thread : threads) { thread.join(); }
+
+    std::cout << "Merging key pointers..." << std::endl;
+    key_pointers_for_test.reserve(kRecordCount);
+    for (uint32_t tid = 0; tid < kNumMutatorThreads; ++tid) {
+        key_pointers_for_test.insert(key_pointers_for_test.end(),
+            local_key_pointers[tid].begin(),
+            local_key_pointers[tid].end());
+    }
+
+    auto load_end = microtime();
+    std::cout << "Loaded in " << (load_end - load_start) / 1000000.0 << " seconds" << std::endl;
+
+    // MODIFICATION: Generate a single, shared, small access pattern array.
+    std::cout << "Generating " << kReqSeqLenPerCore / (1024.0 * 1024.0) << "M shared access indices..." << std::endl;
+    shared_key_indices.resize(kReqSeqLenPerCore);
+    std::mt19937 gen(std::random_device{}());
+    if (kRequestDistribution == "zipfian") {
+        ZipfDistribution zipf(kRecordCount, kZipfParamS);
+        for (uint32_t i = 0; i < kReqSeqLenPerCore; ++i) shared_key_indices[i] = zipf(gen);
+    }
+    else if (kRequestDistribution == "latest") {
+        std::exponential_distribution<double> exp_dist(2.0);
+        for (uint32_t i = 0; i < kReqSeqLenPerCore; ++i) {
+            int64_t offset = static_cast<int64_t>(exp_dist(gen));
+            shared_key_indices[i] = std::max(static_cast<int64_t>(0), kRecordCount - 1 - offset % kRecordCount);
+        }
+    }
+    else if (kRequestDistribution == "sequential") {
+        for (uint32_t i = 0; i < kReqSeqLenPerCore; ++i) shared_key_indices[i] = i % kRecordCount;
+    }
+    else { // uniform
+        std::uniform_int_distribution<uint32_t> dist(0, kRecordCount - 1);
+        for (uint32_t i = 0; i < kReqSeqLenPerCore; ++i) shared_key_indices[i] = dist(gen);
+    }
+    std::cout << "Access pattern generated." << std::endl;
+}
+
+void monitor_perf(); // Definition at the end
+
+void bench_ycsb_operations() {
+    prev_us = microtime();
+    std::vector<std::thread> threads;
+
+    for (uint32_t tid = 0; tid < kNumMutatorThreads; tid++) {
+        threads.emplace_back([&, tid]() {
+            uint32_t cnt = 0;
+            RandomGenerator op_gen; // Thread-local generator for operations
+
+            while (true) {
+                if (cnt++ % kMonitorPerIter == 0) monitor_perf();
+
+                // MODIFICATION: Read from the shared index array, using a thread-local counter to progress.
+                uint32_t key_idx = shared_key_indices[per_core_req_idx++];
+                if (per_core_req_idx == kReqSeqLenPerCore) per_core_req_idx = 0;
+                const Key* key_ptr = key_pointers_for_test[key_idx];
+
+                double op_selector = op_gen.generateDouble();
+                double cumulative = 0.0;
+
+                if ((cumulative += kReadProportion) >= op_selector) {
+                    Value* val_ptr = nullptr;
+                    table_ptr->get(key_ptr, val_ptr);
+                }
+                else if ((cumulative += kUpdateProportion) >= op_selector) {
+                    Value new_val_data;
+                    generateValue(new_val_data.data, kValueLen, op_gen);
+                    table_ptr->update(key_ptr, new_val_data.data);
+                }
+                else if ((cumulative += kInsertProportion) >= op_selector) {
+                    int64_t keynum = global_insert_counter.fetch_add(1);
+                    Key* new_key = new Key();
+                    Value* new_val = new Value();
+                    KeyGenerator::generateKey(keynum, new_key->data, kKeyLen);
+                    generateValue(new_val->data, kValueLen, op_gen);
+                    table_ptr->put(new_key, new_val);
+                }
+                else if ((cumulative += kRMWProportion) >= op_selector) {
+                    Value* val_ptr = nullptr;
+                    if (table_ptr->get(key_ptr, val_ptr)) {
+                        Value new_val_data;
+                        generateValue(new_val_data.data, kValueLen, op_gen);
+                        table_ptr->update(key_ptr, new_val_data.data);
+                    }
+                }
+                cnts[tid].c++;
+            }
+            });
+    }
+    for (auto& thread : threads) { thread.join(); }
+}
+
+int main(int argc, char* argv[]) {
+    if (argc >= 2) {
+        parseWorkloadFile(argv[1]);
+        std::string workload_file = argv[1];
+        std::string log_filename = "cpp_" + workload_file.substr(0, workload_file.find('.')) + ".log";
+        log_file.open(log_filename);
+    }
+
+    ConcurrentHashTable table(kNumBuckets);
+    table_ptr = &table;
+
+    std::cout << "Prepare..." << std::endl;
+    prepare();
+
+    std::cout << "YCSB Operations..." << std::endl;
+    bench_ycsb_operations();
+
+    std::cout << "Cleaning up memory..." << std::endl;
+    table_ptr->clear();
+    std::cout << "Cleanup complete." << std::endl;
+
+    return 0;
+}
+
+// Function definitions moved to the end for clarity
 void parseWorkloadFile(const std::string& filename) {
     std::ifstream file(filename);
     if (!file.is_open()) {
@@ -271,91 +369,6 @@ void parseWorkloadFile(const std::string& filename) {
     std::cout << "Loaded: Read=" << kReadProportion << " Update=" << kUpdateProportion
         << " Insert=" << kInsertProportion << " RMW=" << kRMWProportion
         << " Dist=" << kRequestDistribution << std::endl;
-}
-
-void prepare() {
-    std::cout << "=== C++ YCSB Baseline Benchmark (Low-Memory Mode) ===" << std::endl;
-    std::cout << "Records: " << kRecordCount << std::endl;
-    std::cout << "Threads: " << kNumMutatorThreads << std::endl;
-    std::cout << "Request Distribution: " << kRequestDistribution << std::endl;
-    std::cout << "=====================================================" << std::endl;
-
-    key_pointers_for_test.reserve(kRecordCount);
-
-    for (uint32_t i = 0; i < kNumMutatorThreads; i++) {
-        std::random_device rd;
-        generators[i].reset(new std::mt19937(rd()));
-    }
-
-    std::cout << "Loading " << kRecordCount << " records (on-demand allocation)..." << std::endl;
-    auto load_start = microtime();
-
-    std::vector<std::thread> threads;
-    std::mutex key_vec_mutex;
-
-    for (uint32_t tid = 0; tid < kNumMutatorThreads; tid++) {
-        threads.emplace_back([&, tid]() {
-            auto records_per_thread = kRecordCount / kNumMutatorThreads;
-            auto start_idx = tid * records_per_thread;
-            auto end_idx = start_idx + records_per_thread;
-            if (tid == kNumMutatorThreads - 1) end_idx = kRecordCount;
-
-            DistributionGenerator gen;
-            std::vector<const Key*> local_key_pointers;
-            local_key_pointers.reserve(records_per_thread + 1);
-
-            for (int64_t i = start_idx; i < end_idx; i++) {
-                Key* new_key = new Key();
-                Value* new_val = new Value();
-                KeyGenerator::generateKey(i, new_key->data, kKeyLen);
-                generateValue(new_val->data, kValueLen, gen);
-                table_ptr->put(new_key, new_val);
-                local_key_pointers.push_back(new_key);
-            }
-
-            std::lock_guard<std::mutex> guard(key_vec_mutex);
-            key_pointers_for_test.insert(key_pointers_for_test.end(), local_key_pointers.begin(), local_key_pointers.end());
-            });
-    }
-    for (auto& thread : threads) {
-        thread.join();
-    }
-
-    auto load_end = microtime();
-    auto load_time = (load_end - load_start) / 1000000.0;
-    std::cout << "Loaded in " << load_time << " seconds" << std::endl;
-
-    // NOTE: This allocation is still a single large block. 
-    // If local memory is smaller than ~1.6GB, this could be a bottleneck.
-    // A possible optimization is to generate these indices on-the-fly per thread.
-    std::cout << "Generating access patterns..." << std::endl;
-    DistributionGenerator gen;
-    if (kRequestDistribution == "zipfian") {
-        ZipfDistribution zipf(kRecordCount, kZipfParamS);
-        for (uint32_t i = 0; i < kReqSeqLenPerCore; i++) {
-            auto key_idx = zipf(*generators[0]);
-            all_zipf_key_indices[0][i] = key_idx;
-        }
-    }
-    else if (kRequestDistribution == "uniform") {
-        std::uniform_int_distribution<uint32_t> uniform_dist(0, kRecordCount - 1);
-        for (uint32_t i = 0; i < kReqSeqLenPerCore; i++) {
-            auto key_idx = uniform_dist(*generators[0]);
-            all_zipf_key_indices[0][i] = key_idx;
-        }
-    }
-    else if (kRequestDistribution == "latest") {
-        std::exponential_distribution<double> exp_dist(2.0);
-        for (uint32_t i = 0; i < kReqSeqLenPerCore; i++) {
-            int64_t offset = static_cast<int64_t>(exp_dist(*generators[0]));
-            auto key_idx = std::max(static_cast<int64_t>(0), static_cast<int64_t>(kRecordCount) - 1 - offset % kRecordCount);
-            all_zipf_key_indices[0][i] = static_cast<uint32_t>(key_idx);
-        }
-    }
-    for (uint32_t k = 1; k < kNumMutatorThreads; k++) {
-        memcpy(all_zipf_key_indices[k], all_zipf_key_indices[0], sizeof(uint32_t) * kReqSeqLenPerCore);
-    }
-    std::cout << "Access patterns generated." << std::endl;
 }
 
 void monitor_perf() {
@@ -396,85 +409,4 @@ void monitor_perf() {
         }
         flag.clear();
     }
-}
-
-void bench_ycsb_operations() {
-    prev_us = microtime();
-    std::vector<std::thread> threads;
-
-    for (uint32_t tid = 0; tid < kNumMutatorThreads; tid++) {
-        threads.emplace_back([&, tid]() {
-            uint32_t cnt = 0;
-            DistributionGenerator gen;
-            while (1) {
-                if (cnt++ % kMonitorPerIter == 0) monitor_perf();
-
-                auto key_idx = all_zipf_key_indices[tid][per_core_req_idx++];
-                if (per_core_req_idx == kReqSeqLenPerCore) per_core_req_idx = 0;
-
-                const Key* key_ptr = key_pointers_for_test[key_idx];
-                double op_selector = gen.generateDouble();
-                double cumulative = 0.0;
-
-                if ((cumulative += kReadProportion) >= op_selector) {
-                    // READ
-                    Value* val_ptr = nullptr;
-                    table_ptr->get(key_ptr, val_ptr);
-                }
-                else if ((cumulative += kUpdateProportion) >= op_selector) {
-                    // UPDATE
-                    Value new_val_data; // Temporary value on stack
-                    generateValue(new_val_data.data, kValueLen, gen);
-                    table_ptr->update(key_ptr, new_val_data.data);
-                }
-                else if ((cumulative += kInsertProportion) >= op_selector) {
-                    // INSERT
-                    int64_t keynum = global_insert_counter.fetch_add(1);
-                    Key* new_key = new Key();
-                    Value* new_val = new Value();
-                    KeyGenerator::generateKey(keynum, new_key->data, kKeyLen);
-                    generateValue(new_val->data, kValueLen, gen);
-                    table_ptr->put(new_key, new_val);
-                }
-                else if ((cumulative += kRMWProportion) >= op_selector) {
-                    // READ-MODIFY-WRITE
-                    Value* val_ptr = nullptr;
-                    if (table_ptr->get(key_ptr, val_ptr)) {
-                        Value new_val_data;
-                        generateValue(new_val_data.data, kValueLen, gen);
-                        table_ptr->update(key_ptr, new_val_data.data);
-                    }
-                }
-                cnts[tid].c++;
-            }
-            });
-    }
-    for (auto& thread : threads) {
-        thread.join();
-    }
-}
-
-int main(int argc, char* argv[]) {
-    if (argc >= 2) {
-        parseWorkloadFile(argv[1]);
-        std::string workload_file = argv[1];
-        std::string log_filename = "cpp_" + workload_file.substr(0, workload_file.find('.')) + ".log";
-        log_file.open(log_filename);
-    }
-
-    ConcurrentHashTable table(2048);
-    table_ptr = &table;
-
-    std::cout << "Prepare..." << std::endl;
-    prepare();
-
-    std::cout << "YCSB Operations..." << std::endl;
-    bench_ycsb_operations();
-
-    // Clean up all dynamically allocated keys and values
-    std::cout << "Cleaning up memory..." << std::endl;
-    table_ptr->clear();
-    std::cout << "Cleanup complete." << std::endl;
-
-    return 0;
 }
