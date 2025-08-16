@@ -1,22 +1,22 @@
-#include <algorithm>
-#include <atomic>
-#include <chrono>
-#include <cstdint>
-#include <cstring>
-#include <fstream>
 #include <iostream>
-#include <memory>
-#include <random>
-#include <sstream>
-#include <string>
-#include <thread>
-#include <unordered_map>
 #include <vector>
+#include <string>
+#include <chrono>
+#include <random>
+#include <thread>
+#include <atomic>
+#include <memory>
+#include <unordered_map>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
 #include <iomanip>
 #include <mutex>
 #include <shared_mutex>
-#include <string_view> // Include for string_view
-#include <numeric>     // Include for std::accumulate
+#include <string_view>
+#include <numeric>
+#include <cmath>
+#include <cstring>
 
 // Global parameters - will be overwritten by the workload file
 static double kReadProportion = 0.5;
@@ -28,8 +28,6 @@ static std::string kRequestDistribution = "zipfian";
 
 // Fixed parameters
 constexpr static int64_t kRecordCount = 128000000;
-// Pre-allocate 10% extra space for INSERT operations
-constexpr static int64_t kPaddedRecordCount = static_cast<int64_t>(kRecordCount * 1.1);
 constexpr static uint32_t kKeyLen = 32;
 constexpr static uint32_t kValueLen = 64;
 constexpr static uint32_t kNumMutatorThreads = 400;
@@ -125,16 +123,29 @@ struct Value {
     char data[kValueLen];
 };
 
+// Custom hasher and equality checker for Key pointers
+struct KeyHasher {
+    std::size_t operator()(const Key* k) const {
+        return std::hash<std::string_view>{}(std::string_view(k->data, strnlen(k->data, kKeyLen)));
+    }
+};
+
+struct KeyEqualTo {
+    bool operator()(const Key* lhs, const Key* rhs) const {
+        return std::string_view(lhs->data, strnlen(lhs->data, kKeyLen)) ==
+            std::string_view(rhs->data, strnlen(rhs->data, kKeyLen));
+    }
+};
+
 struct alignas(64) Cnt {
     uint64_t c;
 };
 
-// **Modified** Concurrent Hash Table
+// Concurrent Hash Table for low-memory environments
 class ConcurrentHashTable {
 private:
     struct Bucket {
-        // Use string_view to avoid data copying
-        std::unordered_map<std::string_view, std::string_view> data;
+        std::unordered_map<const Key*, Value*, KeyHasher, KeyEqualTo> data;
         mutable std::shared_mutex mtx;
         char padding[64];
     };
@@ -142,8 +153,8 @@ private:
     std::vector<std::unique_ptr<Bucket>> buckets_;
     size_t mask_;
 
-    size_t getBucket(std::string_view key) const {
-        return std::hash<std::string_view>{}(key)&mask_;
+    size_t getBucket(const Key* key) const {
+        return KeyHasher{}(key)&mask_;
     }
 
 public:
@@ -158,26 +169,22 @@ public:
         mask_ = actual - 1;
     }
 
-    void put(std::string_view key, std::string_view value) {
+    void put(const Key* key, Value* value) {
         auto& bucket = *buckets_[getBucket(key)];
         std::unique_lock<std::shared_mutex> lock(bucket.mtx);
         bucket.data[key] = value;
     }
 
-    // **Added**: For Update/RMW operations, directly modify the Value's memory
-    void update(std::string_view key, const char* new_value_data, size_t new_value_len) {
+    void update(const Key* key, const char* new_value_data) {
         auto& bucket = *buckets_[getBucket(key)];
         std::unique_lock<std::shared_mutex> lock(bucket.mtx);
         auto it = bucket.data.find(key);
         if (it != bucket.data.end()) {
-            // it->second is a string_view, its data() returns a const char*
-            // We cast away constness to modify the memory it points to
-            char* dest = const_cast<char*>(it->second.data());
-            memcpy(dest, new_value_data, std::min((size_t)kValueLen, new_value_len));
+            memcpy(it->second->data, new_value_data, kValueLen);
         }
     }
 
-    bool get(std::string_view key, std::string_view& value) {
+    bool get(const Key* key, Value*& value) {
         auto& bucket = *buckets_[getBucket(key)];
         std::shared_lock<std::shared_mutex> lock(bucket.mtx);
         auto it = bucket.data.find(key);
@@ -190,11 +197,23 @@ public:
 
     size_t size() const {
         size_t total = 0;
-        for (auto& bucket : buckets_) {
-            std::shared_lock<std::shared_mutex> lock(bucket->mtx);
-            total += bucket->data.size();
+        for (const auto& bucket_ptr : buckets_) {
+            std::shared_lock<std::shared_mutex> lock(bucket_ptr->mtx);
+            total += bucket_ptr->data.size();
         }
         return total;
+    }
+
+    // Method to clean up all dynamically allocated memory
+    void clear() {
+        for (auto& bucket_ptr : buckets_) {
+            std::unique_lock<std::shared_mutex> lock(bucket_ptr->mtx);
+            for (auto const& [key, val] : bucket_ptr->data) {
+                delete key;
+                delete val;
+            }
+            bucket_ptr->data.clear();
+        }
     }
 };
 
@@ -202,16 +221,15 @@ public:
 std::atomic_flag flag;
 std::unique_ptr<std::mt19937> generators[kNumMutatorThreads];
 thread_local uint32_t per_core_req_idx = 0;
-Key* all_gen_keys;
-Value* all_gen_values; // **Added**: Unified storage for Values
+// Vector of pointers to keys, used for picking keys during benchmark
+std::vector<const Key*> key_pointers_for_test;
 uint32_t all_zipf_key_indices[kNumMutatorThreads][kReqSeqLenPerCore];
 Cnt cnts[kNumMutatorThreads];
 std::vector<double> mops_vec;
 uint64_t prev_sum_cnts = 0;
 uint64_t prev_us = 0;
 uint64_t running_us = 0;
-// Atomic counter starts from kRecordCount to assign indices for new inserts
-std::atomic<int64_t> global_insert_idx{ kRecordCount };
+std::atomic<int64_t> global_insert_counter{ kRecordCount };
 ConcurrentHashTable* table_ptr;
 std::ofstream log_file;
 
@@ -228,27 +246,21 @@ void generateValue(char* data, uint32_t len, DistributionGenerator& gen) {
     data[len - 1] = '\0';
 }
 
-// Parse workload file
 void parseWorkloadFile(const std::string& filename) {
     std::ifstream file(filename);
     if (!file.is_open()) {
         std::cout << "Warning: Could not open " << filename << ", using defaults" << std::endl;
         return;
     }
-
     std::cout << "Parsing " << filename << std::endl;
     std::string line;
     while (std::getline(file, line)) {
-        // Remove whitespace
         line.erase(std::remove_if(line.begin(), line.end(), ::isspace), line.end());
         if (line.empty() || line[0] == '#') continue;
-
         auto eq_pos = line.find('=');
         if (eq_pos == std::string::npos) continue;
-
         auto key = line.substr(0, eq_pos);
         auto value = line.substr(eq_pos + 1);
-
         if (key == "readproportion") kReadProportion = std::stod(value);
         else if (key == "updateproportion") kUpdateProportion = std::stod(value);
         else if (key == "insertproportion") kInsertProportion = std::stod(value);
@@ -256,56 +268,53 @@ void parseWorkloadFile(const std::string& filename) {
         else if (key == "readmodifywriteproportion") kRMWProportion = std::stod(value);
         else if (key == "requestdistribution") kRequestDistribution = value;
     }
-
     std::cout << "Loaded: Read=" << kReadProportion << " Update=" << kUpdateProportion
         << " Insert=" << kInsertProportion << " RMW=" << kRMWProportion
         << " Dist=" << kRequestDistribution << std::endl;
 }
 
 void prepare() {
-    std::cout << "=== C++ YCSB Baseline Benchmark ===" << std::endl;
-    std::cout << "Records: " << kRecordCount << " (Padded: " << kPaddedRecordCount << ")" << std::endl;
+    std::cout << "=== C++ YCSB Baseline Benchmark (Low-Memory Mode) ===" << std::endl;
+    std::cout << "Records: " << kRecordCount << std::endl;
     std::cout << "Threads: " << kNumMutatorThreads << std::endl;
-    std::cout << "Operations: Read(" << kReadProportion << ") Update(" << kUpdateProportion
-        << ") Insert(" << kInsertProportion << ") RMW(" << kRMWProportion << ")" << std::endl;
     std::cout << "Request Distribution: " << kRequestDistribution << std::endl;
-    std::cout << "===================================" << std::endl;
+    std::cout << "=====================================================" << std::endl;
 
-    // Allocate arrays for keys and values
-    all_gen_keys = new Key[kPaddedRecordCount];
-    all_gen_values = new Value[kPaddedRecordCount];
+    key_pointers_for_test.reserve(kRecordCount);
 
-    // Initialize random number generators
     for (uint32_t i = 0; i < kNumMutatorThreads; i++) {
         std::random_device rd;
         generators[i].reset(new std::mt19937(rd()));
     }
 
-    // Data loading
-    std::cout << "Loading " << kRecordCount << " records..." << std::endl;
+    std::cout << "Loading " << kRecordCount << " records (on-demand allocation)..." << std::endl;
     auto load_start = microtime();
 
     std::vector<std::thread> threads;
+    std::mutex key_vec_mutex;
+
     for (uint32_t tid = 0; tid < kNumMutatorThreads; tid++) {
         threads.emplace_back([&, tid]() {
             auto records_per_thread = kRecordCount / kNumMutatorThreads;
             auto start_idx = tid * records_per_thread;
             auto end_idx = start_idx + records_per_thread;
-            if (tid == kNumMutatorThreads - 1) {
-                end_idx = kRecordCount;
-            }
+            if (tid == kNumMutatorThreads - 1) end_idx = kRecordCount;
 
             DistributionGenerator gen;
-            for (int64_t i = start_idx; i < end_idx; i++) {
-                // Generate data directly into the pre-allocated arrays
-                KeyGenerator::generateKey(i, all_gen_keys[i].data, kKeyLen);
-                generateValue(all_gen_values[i].data, kValueLen, gen);
+            std::vector<const Key*> local_key_pointers;
+            local_key_pointers.reserve(records_per_thread + 1);
 
-                // Insert using string_view, no data copy involved
-                std::string_view key_sv(all_gen_keys[i].data, strnlen(all_gen_keys[i].data, kKeyLen));
-                std::string_view val_sv(all_gen_values[i].data, strnlen(all_gen_values[i].data, kValueLen));
-                table_ptr->put(key_sv, val_sv);
+            for (int64_t i = start_idx; i < end_idx; i++) {
+                Key* new_key = new Key();
+                Value* new_val = new Value();
+                KeyGenerator::generateKey(i, new_key->data, kKeyLen);
+                generateValue(new_val->data, kValueLen, gen);
+                table_ptr->put(new_key, new_val);
+                local_key_pointers.push_back(new_key);
             }
+
+            std::lock_guard<std::mutex> guard(key_vec_mutex);
+            key_pointers_for_test.insert(key_pointers_for_test.end(), local_key_pointers.begin(), local_key_pointers.end());
             });
     }
     for (auto& thread : threads) {
@@ -316,7 +325,10 @@ void prepare() {
     auto load_time = (load_end - load_start) / 1000000.0;
     std::cout << "Loaded in " << load_time << " seconds" << std::endl;
 
-    // Generate access patterns
+    // NOTE: This allocation is still a single large block. 
+    // If local memory is smaller than ~1.6GB, this could be a bottleneck.
+    // A possible optimization is to generate these indices on-the-fly per thread.
+    std::cout << "Generating access patterns..." << std::endl;
     DistributionGenerator gen;
     if (kRequestDistribution == "zipfian") {
         ZipfDistribution zipf(kRecordCount, kZipfParamS);
@@ -336,17 +348,14 @@ void prepare() {
         std::exponential_distribution<double> exp_dist(2.0);
         for (uint32_t i = 0; i < kReqSeqLenPerCore; i++) {
             int64_t offset = static_cast<int64_t>(exp_dist(*generators[0]));
-            auto key_idx = std::max(static_cast<int64_t>(0),
-                static_cast<int64_t>(kRecordCount) - 1 - offset % kRecordCount);
+            auto key_idx = std::max(static_cast<int64_t>(0), static_cast<int64_t>(kRecordCount) - 1 - offset % kRecordCount);
             all_zipf_key_indices[0][i] = static_cast<uint32_t>(key_idx);
         }
     }
-
-    // Copy access patterns to all threads
     for (uint32_t k = 1; k < kNumMutatorThreads; k++) {
-        memcpy(all_zipf_key_indices[k], all_zipf_key_indices[0],
-            sizeof(uint32_t) * kReqSeqLenPerCore);
+        memcpy(all_zipf_key_indices[k], all_zipf_key_indices[0], sizeof(uint32_t) * kReqSeqLenPerCore);
     }
+    std::cout << "Access patterns generated." << std::endl;
 }
 
 void monitor_perf() {
@@ -361,26 +370,20 @@ void monitor_perf() {
             auto mops = (double)(sum_cnts - prev_sum_cnts) / (us - prev_us);
             mops_vec.push_back(mops);
             running_us += (us - prev_us);
-
             auto output = "[" + std::to_string(running_us / 1000000) + "s] MOPS: " +
                 std::to_string(mops) + " | Total Ops: " +
                 std::to_string(sum_cnts / 1000000) + "M";
-
             std::cout << output << std::endl;
             if (log_file.is_open()) {
                 log_file << output << std::endl;
                 log_file.flush();
             }
-
             if (running_us >= kMaxRunningUs) {
-                std::vector<double> last_5_mops(
-                    mops_vec.end() - std::min(static_cast<int>(mops_vec.size()), 5),
-                    mops_vec.end());
+                std::vector<double> last_5_mops(mops_vec.end() - std::min(static_cast<int>(mops_vec.size()), 5), mops_vec.end());
                 double final_mops = 0.0;
                 if (!last_5_mops.empty()) {
                     final_mops = std::accumulate(last_5_mops.begin(), last_5_mops.end(), 0.0) / last_5_mops.size();
                 }
-
                 std::cout << "mops = " << final_mops << std::endl;
                 if (log_file.is_open()) {
                     log_file << "mops = " << final_mops << std::endl;
@@ -403,53 +406,45 @@ void bench_ycsb_operations() {
         threads.emplace_back([&, tid]() {
             uint32_t cnt = 0;
             DistributionGenerator gen;
-
             while (1) {
                 if (cnt++ % kMonitorPerIter == 0) monitor_perf();
 
                 auto key_idx = all_zipf_key_indices[tid][per_core_req_idx++];
                 if (per_core_req_idx == kReqSeqLenPerCore) per_core_req_idx = 0;
 
+                const Key* key_ptr = key_pointers_for_test[key_idx];
                 double op_selector = gen.generateDouble();
                 double cumulative = 0.0;
 
-                Key& key_ref = all_gen_keys[key_idx];
-                std::string_view key_sv(key_ref.data, strnlen(key_ref.data, kKeyLen));
-
                 if ((cumulative += kReadProportion) >= op_selector) {
                     // READ
-                    std::string_view val_sv;
-                    table_ptr->get(key_sv, val_sv);
+                    Value* val_ptr = nullptr;
+                    table_ptr->get(key_ptr, val_ptr);
                 }
                 else if ((cumulative += kUpdateProportion) >= op_selector) {
                     // UPDATE
-                    Value new_val;
-                    generateValue(new_val.data, kValueLen, gen);
-                    table_ptr->update(key_sv, new_val.data, kValueLen);
+                    Value new_val_data; // Temporary value on stack
+                    generateValue(new_val_data.data, kValueLen, gen);
+                    table_ptr->update(key_ptr, new_val_data.data);
                 }
                 else if ((cumulative += kInsertProportion) >= op_selector) {
                     // INSERT
-                    int64_t insert_idx = global_insert_idx.fetch_add(1);
-                    if (insert_idx < kPaddedRecordCount) {
-                        // Generate new data in the pre-allocated space
-                        KeyGenerator::generateKey(insert_idx, all_gen_keys[insert_idx].data, kKeyLen);
-                        generateValue(all_gen_values[insert_idx].data, kValueLen, gen);
-
-                        std::string_view new_key_sv(all_gen_keys[insert_idx].data, strnlen(all_gen_keys[insert_idx].data, kKeyLen));
-                        std::string_view new_val_sv(all_gen_values[insert_idx].data, strnlen(all_gen_values[insert_idx].data, kValueLen));
-                        table_ptr->put(new_key_sv, new_val_sv);
-                    }
+                    int64_t keynum = global_insert_counter.fetch_add(1);
+                    Key* new_key = new Key();
+                    Value* new_val = new Value();
+                    KeyGenerator::generateKey(keynum, new_key->data, kKeyLen);
+                    generateValue(new_val->data, kValueLen, gen);
+                    table_ptr->put(new_key, new_val);
                 }
                 else if ((cumulative += kRMWProportion) >= op_selector) {
                     // READ-MODIFY-WRITE
-                    std::string_view val_sv;
-                    if (table_ptr->get(key_sv, val_sv)) {
-                        Value new_val;
-                        generateValue(new_val.data, kValueLen, gen);
-                        table_ptr->update(key_sv, new_val.data, kValueLen);
+                    Value* val_ptr = nullptr;
+                    if (table_ptr->get(key_ptr, val_ptr)) {
+                        Value new_val_data;
+                        generateValue(new_val_data.data, kValueLen, gen);
+                        table_ptr->update(key_ptr, new_val_data.data);
                     }
                 }
-
                 cnts[tid].c++;
             }
             });
@@ -472,12 +467,14 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Prepare..." << std::endl;
     prepare();
+
     std::cout << "YCSB Operations..." << std::endl;
     bench_ycsb_operations();
 
-    // Clean up globally allocated memory
-    delete[] all_gen_keys;
-    delete[] all_gen_values;
+    // Clean up all dynamically allocated keys and values
+    std::cout << "Cleaning up memory..." << std::endl;
+    table_ptr->clear();
+    std::cout << "Cleanup complete." << std::endl;
 
     return 0;
 }
